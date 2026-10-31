@@ -2,8 +2,7 @@
 
     <PropertyGroup>
         <TmlBuildUseDefaultModImpl>true</TmlBuildUseDefaultModImpl>
-        <TargetFramework>net10.0</TargetFramework>
-        <TmlVersion>dev</TmlVersion>
+        <TargetFramework>net8.0</TargetFramework>
     </PropertyGroup>
 
     <ItemGroup>
