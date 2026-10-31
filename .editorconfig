@@ -1,0 +1,16 @@
+﻿[*]
+charset = utf-8
+end_of_line = crlf
+trim_trailing_whitespace = true
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+
+[*.{json,jsonc,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.{cs,hlsl,hlsli,fx}]
+indent_style = space
+indent_size = 4
+tab_width = 4
