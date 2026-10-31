@@ -1,0 +1,14 @@
+Mods: {
+	StevensAntiVertigo: {
+		Configs: {
+			AntiVertigoConfig: {
+				DisplayName: Anti Vertigo Config
+
+				ParallaxSync: {
+					Label: Parallax Sync Speed in %
+					Tooltip: Synchronizes background parallax scroll speed with player movement (0% is vanilla, 100% is full movement sync)
+				}
+			}
+		}
+	}
+}

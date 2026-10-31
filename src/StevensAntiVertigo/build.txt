@@ -1,4 +1,4 @@
 ﻿displayName = Stevens Anti-Vertigo
 author = wxo
 version = 0.1.0
-side = Both
+side = Client
