@@ -4,9 +4,34 @@ Mods: {
 			AntiVertigoConfig: {
 				DisplayName: Anti Vertigo Config
 
+				Headers: {
+					Parallax: Parallax Settings
+					ColorAdjust: Display Color Settings
+				}
+
 				ParallaxSync: {
 					Label: Parallax Sync Speed in %
 					Tooltip: Synchronizes background parallax scroll speed with player movement (0% is vanilla, 100% is full movement sync)
+				}
+
+				Brightness: {
+					Label: Brightness in %
+					Tooltip: Adjusts world brightness (50% is vanilla default, below 50% reduces glare)
+				}
+
+				Contrast: {
+					Label: Contrast in %
+					Tooltip: Adjusts tonal contrast relative to the midpoint (50% is vanilla default)
+				}
+
+				Gamma: {
+					Label: Gamma in %
+					Tooltip: Adjusts shadow and cave luminosity without clipping bright skies (100% is vanilla 1.0 gamma)
+				}
+
+				DigitalVibrance: {
+					Label: Digital Vibrance in %
+					Tooltip: Smart saturation adjustment that protects already vivid colors (50% is vanilla default)
 				}
 			}
 		}
