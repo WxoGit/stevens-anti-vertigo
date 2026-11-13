@@ -21,7 +21,7 @@ on:
         description: 'Publish GitHub Release with the built .tmod'
         type: boolean
         required: false
-        default: false
+        default: true
       release_tag:
         description: 'Tag name for manual release (defaults to v<version from build.txt>)'
         required: false
@@ -448,7 +448,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_release)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
