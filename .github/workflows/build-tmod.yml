@@ -1,0 +1,489 @@
+name: Build tModLoader Mod
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      tml_version:
+        description: 'tModLoader version override (optional: stable, preview, or e.g. 2026.9.3.1)'
+        required: false
+        default: ''
+      create_release:
+        description: 'Publish GitHub Release with the built .tmod'
+        type: boolean
+        required: false
+        default: false
+      release_tag:
+        description: 'Tag name for manual release (defaults to v<version from build.txt>)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      TML_BUILD_CACHE_DIRECTORY: ${{ runner.temp }}\tml-build\
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Cache NuGet and tml-build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+            ${{ runner.temp }}/tml-build
+          key: tmod-build-${{ runner.os }}-${{ hashFiles('**/global.json', '**/*.csproj', '**/build.txt') }}
+          restore-keys: |
+            tmod-build-${{ runner.os }}-
+
+      - name: Build .tmod
+        id: build_mod
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TML_VERSION: ${{ inputs.tml_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $cacheDir = $env:TML_BUILD_CACHE_DIRECTORY
+          $artifactsDir = Join-Path $workspace 'artifacts'
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
+
+          function Parse-FourPartVersion([string]$tag) {
+              $clean = $tag.TrimStart('v', 'V')
+              $v = $null
+              if ([System.Version]::TryParse($clean, [ref]$v) -and $v.Build -ge 0 -and $v.Revision -ge 0) {
+                  return $v
+              }
+              return $null
+          }
+
+          function Get-TmlReleases([string]$requiredVersion) {
+              $headers = @{
+                  'Accept'     = 'application/vnd.github+json'
+                  'User-Agent' = 'tmod-github-action'
+              }
+              if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+                  $headers['Authorization'] = "Bearer $($env:GH_TOKEN)"
+              }
+
+              $all = @()
+              for ($page = 1; $page -le 5; $page++) {
+                  $uri = "https://api.github.com/repos/tModLoader/tModLoader/releases?per_page=100&page=$page"
+                  $batch = Invoke-RestMethod -Uri $uri -Headers $headers
+                  if (-not $batch -or $batch.Count -eq 0) { break }
+                  $all += $batch
+
+                  if ([string]::IsNullOrWhiteSpace($requiredVersion) -or $requiredVersion -in @('stable', 'preview')) {
+                      $hasStable = $all | Where-Object { -not $_.prerelease -and ($_.assets | Where-Object { $_.name -eq 'tModLoader.zip' }) } | Select-Object -First 1
+                      $hasPreview = $all | Where-Object { $_.prerelease -and ($_.assets | Where-Object { $_.name -eq 'tModLoader.zip' }) } | Select-Object -First 1
+                      if ($hasStable -and $hasPreview) { break }
+                  }
+                  else {
+                      $reqVer = Parse-FourPartVersion $requiredVersion
+                      $matched = $all | Where-Object {
+                          $pv = Parse-FourPartVersion $_.tag_name
+                          $pv -and $reqVer -and ($pv -eq $reqVer) -and ($_.assets | Where-Object { $_.name -eq 'tModLoader.zip' })
+                      } | Select-Object -First 1
+                      if ($matched) { break }
+                  }
+              }
+
+              $entries = @()
+              $stableVer = $null
+              $previewVer = $null
+              $ordered = $all | Sort-Object { [DateTimeOffset]$_.published_at } -Descending
+              foreach ($rel in $ordered) {
+                  $ver = Parse-FourPartVersion $rel.tag_name
+                  if (-not $ver) { continue }
+                  $asset = $rel.assets | Where-Object { $_.name -eq 'tModLoader.zip' } | Select-Object -First 1
+                  if (-not $asset) { continue }
+
+                  $entries += [PSCustomObject]@{
+                      Version = $ver
+                      Url     = $asset.browser_download_url
+                  }
+                  if (-not $rel.prerelease -and -not $stableVer) { $stableVer = $ver }
+                  if ($rel.prerelease -and -not $previewVer) { $previewVer = $ver }
+              }
+
+              if ($entries.Count -eq 0) {
+                  throw "No tModLoader releases with a tModLoader.zip asset were found."
+              }
+              if (-not $stableVer) { $stableVer = $entries[0].Version }
+              if (-not $previewVer) { $previewVer = $stableVer }
+
+              return [PSCustomObject]@{
+                  Entries = $entries
+                  Stable  = $stableVer
+                  Preview = $previewVer
+              }
+          }
+
+          function Test-CachedVersionPresent([string]$cacheFile, [string]$requiredVersion) {
+              $reqVer = Parse-FourPartVersion $requiredVersion
+              if (-not $reqVer) { return $false }
+              $fs = [System.IO.File]::OpenRead($cacheFile)
+              try {
+                  $br = New-Object System.IO.BinaryReader($fs)
+                  [void]$br.ReadInt64()
+                  $count = $br.ReadInt32()
+                  for ($i = 0; $i -lt $count; $i++) {
+                      $v = [System.Version]::new($br.ReadInt32(), $br.ReadInt32(), $br.ReadInt32(), $br.ReadInt32())
+                      [void]$br.ReadString()
+                      if ($v -eq $reqVer) { return $true }
+                  }
+              }
+              finally {
+                  $fs.Dispose()
+              }
+              return $false
+          }
+
+          function Ensure-CachedVersions([string]$targetDir, [string]$requiredVersion) {
+              $cacheFile = Join-Path $targetDir 'cached_versions'
+              $needsRefresh = $true
+              if (Test-Path $cacheFile) {
+                  $age = (Get-Date) - (Get-Item $cacheFile).LastWriteTime
+                  if ($age.TotalHours -lt 12) {
+                      $needsRefresh = $false
+                  }
+              }
+
+              if (-not $needsRefresh -and -not [string]::IsNullOrWhiteSpace($requiredVersion) -and $requiredVersion -notin @('stable', 'preview')) {
+                  if (-not (Test-CachedVersionPresent $cacheFile $requiredVersion)) {
+                      $needsRefresh = $true
+                  }
+              }
+
+              if (-not $needsRefresh) { return }
+
+              $info = Get-TmlReleases $requiredVersion
+              $tmpFile = "$cacheFile.tmp"
+              $fs = [System.IO.File]::Create($tmpFile)
+              try {
+                  $bw = New-Object System.IO.BinaryWriter($fs)
+                  $bw.Write([DateTime]::Now.ToBinary())
+                  $bw.Write([int]$info.Entries.Count)
+                  foreach ($e in $info.Entries) {
+                      $bw.Write([int]$e.Version.Major)
+                      $bw.Write([int]$e.Version.Minor)
+                      $bw.Write([int]$e.Version.Build)
+                      $bw.Write([int]$e.Version.Revision)
+                      $bw.Write([string]$e.Url)
+                  }
+                  $bw.Write([int]$info.Stable.Major)
+                  $bw.Write([int]$info.Stable.Minor)
+                  $bw.Write([int]$info.Stable.Build)
+                  $bw.Write([int]$info.Stable.Revision)
+                  $bw.Write([int]$info.Preview.Major)
+                  $bw.Write([int]$info.Preview.Minor)
+                  $bw.Write([int]$info.Preview.Build)
+                  $bw.Write([int]$info.Preview.Revision)
+                  $bw.Flush()
+              }
+              finally {
+                  $fs.Dispose()
+              }
+              Move-Item -Path $tmpFile -Destination $cacheFile -Force
+          }
+
+          function Get-BuildTxtInfo([string]$path) {
+              $result = @{
+                  DisplayName = ''
+                  Version     = '0.1.0'
+              }
+              if (-not (Test-Path $path)) { return $result }
+              foreach ($line in (Get-Content $path)) {
+                  if ($line -match '^\s*displayName\s*=\s*(.+?)\s*$') {
+                      $result.DisplayName = $Matches[1].Trim()
+                  }
+                  elseif ($line -match '^\s*version\s*=\s*(.+?)\s*$') {
+                      $result.Version = $Matches[1].Trim()
+                  }
+              }
+              return $result
+          }
+
+          function Get-CsprojAssemblyName([string]$csprojPath) {
+              [xml]$xml = Get-Content $csprojPath
+              foreach ($pg in $xml.Project.PropertyGroup) {
+                  if ($pg.AssemblyName) {
+                      return $pg.AssemblyName.Trim()
+                  }
+              }
+              return [System.IO.Path]::GetFileNameWithoutExtension($csprojPath)
+          }
+
+          $ignoredDirRegex = '\\(\.git|bin|obj|\.vs|\.idea|artifacts)\\'
+          $allCsprojs = Get-ChildItem -Path $workspace -Recurse -Filter '*.csproj' -File | Where-Object {
+              $_.FullName -notmatch $ignoredDirRegex
+          }
+
+          $tomatMods = @()
+          foreach ($proj in $allCsprojs) {
+              $content = Get-Content $proj.FullName -Raw
+              if ($content -notmatch 'Tomat\.Terraria\.ModLoader\.Sdk') { continue }
+              if ($content -match '<TmlBuildPackageMod>\s*false\s*</TmlBuildPackageMod>') { continue }
+              if ($content -match '<TmlBuildMod>\s*false\s*</TmlBuildMod>') { continue }
+              $dir = $proj.DirectoryName
+              if (Test-Path (Join-Path $dir 'build.txt')) {
+                  $tomatMods += $proj
+              }
+          }
+
+          if ($tomatMods.Count -eq 0) {
+              $tomatMods = $allCsprojs | Where-Object {
+                  $content = Get-Content $_.FullName -Raw
+                  ($content -match 'Tomat\.Terraria\.ModLoader\.Sdk') -and
+                  ($content -notmatch '<TmlBuildPackageMod>\s*false\s*</TmlBuildPackageMod>') -and
+                  ($content -notmatch '<TmlBuildMod>\s*false\s*</TmlBuildMod>')
+              }
+          }
+
+          $builtRecords = @()
+          $tmlOverride = $env:INPUT_TML_VERSION.Trim()
+          $tmlPropArgs = @()
+          if (-not [string]::IsNullOrWhiteSpace($tmlOverride)) {
+              $tmlPropArgs += "-p:TmlVersion=$tmlOverride"
+          }
+
+          if ($tomatMods.Count -gt 0) {
+              Write-Host "Detected Tomat.Terraria.ModLoader.Sdk project(s): $($tomatMods.Count)"
+              Ensure-CachedVersions $cacheDir $tmlOverride
+
+              $aliasFile = Join-Path $cacheDir 'version-aliases.props'
+              $versionsDir = Join-Path $cacheDir 'versions'
+              if ((Test-Path $aliasFile) -and (-not (Test-Path $versionsDir))) {
+                  Remove-Item $aliasFile -Force
+              }
+
+              foreach ($proj in $tomatMods) {
+                  $projDir = $proj.DirectoryName
+                  $modName = Get-CsprojAssemblyName $proj.FullName
+                  $buildInfo = Get-BuildTxtInfo (Join-Path $projDir 'build.txt')
+                  $outTmod = Join-Path $artifactsDir "$modName.tmod"
+
+                  Write-Host "=== Building $modName ($($proj.FullName)) ==="
+                  & dotnet restore $proj.FullName @tmlPropArgs
+                  if ($LASTEXITCODE -ne 0) { throw "dotnet restore (pass 1) failed for $modName" }
+
+                  $assetsFile = Join-Path $projDir 'obj\project.assets.json'
+                  $assetsHasTml = (Test-Path $assetsFile) -and ((Get-Content $assetsFile -Raw) -match '"tModLoader/')
+                  if (-not $assetsHasTml) {
+                      Write-Host "Running second restore pass so Sdk.props picks up version-aliases.props..."
+                      & dotnet restore $proj.FullName @tmlPropArgs
+                      if ($LASTEXITCODE -ne 0) { throw "dotnet restore (pass 2) failed for $modName" }
+                  }
+
+                  & dotnet msbuild $proj.FullName -t:CompileShaders -p:Configuration=Release @tmlPropArgs
+                  if ($LASTEXITCODE -ne 0) { throw "CompileShaders failed for $modName" }
+
+                  & dotnet build $proj.FullName -c Release --no-restore -p:TmlBuildGenerateLaunchSettings=false "-p:TmodOutputPath=$outTmod" @tmlPropArgs
+                  if ($LASTEXITCODE -ne 0) { throw "dotnet build failed for $modName" }
+
+                  if (-not (Test-Path $outTmod)) { throw "Expected .tmod output not found: $outTmod" }
+                  $builtRecords += [PSCustomObject]@{
+                      Name        = $modName
+                      DisplayName = if ($buildInfo.DisplayName) { $buildInfo.DisplayName } else { $modName }
+                      Version     = $buildInfo.Version
+                      File        = $outTmod
+                      Mode        = 'Tomat.Terraria.ModLoader.Sdk'
+                  }
+              }
+          }
+          else {
+              Write-Host "No Tomat.Terraria.ModLoader.Sdk projects found; using standard tModLoader headless build."
+              $buildTxts = Get-ChildItem -Path $workspace -Recurse -Filter 'build.txt' -File | Where-Object {
+                  $_.FullName -notmatch $ignoredDirRegex
+              }
+              if ($buildTxts.Count -eq 0) {
+                  throw "No tModLoader mods (csproj with Tomat SDK or build.txt) found in repository."
+              }
+
+              $releases = Get-TmlReleases $tmlOverride
+              $targetEntry = $null
+              if ([string]::IsNullOrWhiteSpace($tmlOverride) -or $tmlOverride -eq 'stable') {
+                  $targetEntry = $releases.Entries | Where-Object { $_.Version -eq $releases.Stable } | Select-Object -First 1
+              }
+              elseif ($tmlOverride -eq 'preview') {
+                  $targetEntry = $releases.Entries | Where-Object { $_.Version -eq $releases.Preview } | Select-Object -First 1
+              }
+              else {
+                  $reqVer = Parse-FourPartVersion $tmlOverride
+                  $targetEntry = $releases.Entries | Where-Object { $_.Version -eq $reqVer } | Select-Object -First 1
+              }
+              if (-not $targetEntry) { throw "Could not resolve tModLoader release for '$tmlOverride'" }
+
+              $tmlExtractDir = Join-Path $cacheDir "versions\$($targetEntry.Version)"
+              $tmlDll = Join-Path $tmlExtractDir 'tModLoader.dll'
+              if (-not (Test-Path $tmlDll)) {
+                  $zipPath = Join-Path $env:RUNNER_TEMP "tModLoader-$($targetEntry.Version).zip"
+                  Write-Host "Downloading tModLoader $($targetEntry.Version) from $($targetEntry.Url)..."
+                  Invoke-WebRequest -Uri $targetEntry.Url -OutFile $zipPath
+                  New-Item -ItemType Directory -Force -Path $tmlExtractDir | Out-Null
+                  Expand-Archive -Path $zipPath -DestinationPath $tmlExtractDir -Force
+                  Remove-Item $zipPath -Force
+              }
+
+              $saveDir = Join-Path $env:RUNNER_TEMP 'tml-save'
+              $modSourcesDir = Join-Path $saveDir 'ModSources'
+              $modsOutDir = Join-Path $saveDir 'Mods'
+              New-Item -ItemType Directory -Force -Path $modSourcesDir | Out-Null
+              New-Item -ItemType Directory -Force -Path $modsOutDir | Out-Null
+
+              $tmlTargets = Join-Path $tmlExtractDir 'tMLMod.targets'
+              $modTargetsContent = "<Project ToolsVersion=`"14.0`" xmlns=`"http://schemas.microsoft.com/developer/msbuild/2003`">`r`n  <Import Project=`"$([System.Security.SecurityElement]::Escape($tmlTargets))`" />`r`n</Project>"
+              Set-Content -Path (Join-Path $modSourcesDir 'tModLoader.targets') -Value $modTargetsContent -Encoding UTF8
+
+              foreach ($bt in $buildTxts) {
+                  $srcDir = $bt.DirectoryName
+                  $localCsproj = Get-ChildItem -Path $srcDir -Filter '*.csproj' -File | Select-Object -First 1
+                  if ($localCsproj) {
+                      $modName = Get-CsprojAssemblyName $localCsproj.FullName
+                  }
+                  elseif ($srcDir -eq $workspace) {
+                      $modName = ($env:GITHUB_REPOSITORY -split '/')[-1]
+                  }
+                  else {
+                      $modName = Split-Path $srcDir -Leaf
+                  }
+
+                  $buildInfo = Get-BuildTxtInfo $bt.FullName
+                  $stagedModDir = Join-Path $modSourcesDir $modName
+                  if (Test-Path $stagedModDir) { Remove-Item $stagedModDir -Recurse -Force }
+                  New-Item -ItemType Directory -Force -Path $stagedModDir | Out-Null
+
+                  $robocopyArgs = @($srcDir, $stagedModDir, '/E', '/XD', '.git', '.github', 'bin', 'obj', '.vs', '.idea', 'artifacts', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+                  & robocopy @robocopyArgs | Out-Null
+                  if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $modName with exit code $LASTEXITCODE" }
+
+                  $stagedCsproj = if ($localCsproj) { Join-Path $stagedModDir $localCsproj.Name } else { $null }
+                  if ($stagedCsproj -and (Test-Path $stagedCsproj)) {
+                      & dotnet restore $stagedCsproj
+                      if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed for $modName" }
+                      & dotnet build $stagedCsproj -c Release --no-restore -p:BuildMod=false
+                      if ($LASTEXITCODE -ne 0) { throw "dotnet build failed for $modName" }
+
+                      $propsJson = & dotnet msbuild $stagedCsproj -p:Configuration=Release -getProperty:TargetPath -getProperty:DefineConstants -getProperty:AllowUnsafeBlocks | ConvertFrom-Json
+                      $targetDll = $propsJson.Properties.TargetPath
+                      $defines = $propsJson.Properties.DefineConstants
+                      $allowUnsafe = $propsJson.Properties.AllowUnsafeBlocks
+                      if ([string]::IsNullOrWhiteSpace($allowUnsafe)) { $allowUnsafe = 'false' }
+
+                      $tmlArgs = @($tmlDll, '-server', '-tmlsavedirectory', $saveDir, '-build', $stagedModDir)
+                      if (-not [string]::IsNullOrWhiteSpace($targetDll)) {
+                          $tmlArgs += @('-eac', $targetDll)
+                      }
+                      if (-not [string]::IsNullOrWhiteSpace($defines)) {
+                          $tmlArgs += @('-define', $defines)
+                      }
+                      $tmlArgs += @('-unsafe', $allowUnsafe)
+
+                      & dotnet @tmlArgs
+                  }
+                  else {
+                      & dotnet $tmlDll -server -tmlsavedirectory $saveDir -build $stagedModDir
+                  }
+                  if ($LASTEXITCODE -ne 0) { throw "tModLoader -build failed for $modName" }
+
+                  $builtTmod = Join-Path $modsOutDir "$modName.tmod"
+                  if (-not (Test-Path $builtTmod)) { throw "Expected .tmod output not found: $builtTmod" }
+                  $outTmod = Join-Path $artifactsDir "$modName.tmod"
+                  Copy-Item $builtTmod $outTmod -Force
+
+                  $builtRecords += [PSCustomObject]@{
+                      Name        = $modName
+                      DisplayName = if ($buildInfo.DisplayName) { $buildInfo.DisplayName } else { $modName }
+                      Version     = $buildInfo.Version
+                      File        = $outTmod
+                      Mode        = "tModLoader $($targetEntry.Version)"
+                  }
+              }
+          }
+
+          if ($builtRecords.Count -eq 0) {
+              throw "No .tmod artifacts were produced."
+          }
+
+          "primary_version=$($builtRecords[0].Version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "primary_name=$($builtRecords[0].Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Built tModLoader Artifacts`n`n| Mod | Display Name | Version | Mode | Size |`n| :--- | :--- | :--- | :--- | :--- |" -Encoding utf8
+          foreach ($rec in $builtRecords) {
+              $kb = [Math]::Round((Get-Item $rec.File).Length / 1KB, 1)
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "| ``$($rec.Name).tmod`` | $($rec.DisplayName) | $($rec.Version) | $($rec.Mode) | ${kb} KB |" -Encoding utf8
+          }
+
+      - name: Upload .tmod artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-tmod
+          path: artifacts/*.tmod
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          PRIMARY_VERSION: ${{ steps.build_mod.outputs.primary_version }}
+          PRIMARY_NAME: ${{ steps.build_mod.outputs.primary_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+              $tag = $env:GITHUB_REF_NAME
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_RELEASE_TAG)) {
+              $tag = $env:INPUT_RELEASE_TAG.Trim()
+          }
+          else {
+              $tag = "v$($env:PRIMARY_VERSION)"
+          }
+
+          $tmods = @(Get-ChildItem -Path 'artifacts' -Filter '*.tmod' | Select-Object -ExpandProperty FullName)
+          if ($tmods.Count -eq 0) { throw "No .tmod files found to attach to release." }
+
+          $ErrorActionPreference = 'Continue'
+          & gh release view $tag --json tagName *> $null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
+
+          if ($releaseExists) {
+              Write-Host "Updating existing release $tag..."
+              & gh release upload $tag @tmods --clobber
+              if ($LASTEXITCODE -ne 0) { throw "gh release upload failed for $tag" }
+          }
+          else {
+              Write-Host "Creating release $tag..."
+              $title = "$($env:PRIMARY_NAME) $tag"
+              & gh release create $tag @tmods --title $title --generate-notes --target $env:GITHUB_SHA
+              if ($LASTEXITCODE -ne 0) { throw "gh release create failed for $tag" }
+          }
