@@ -1,4 +1,5 @@
-﻿displayName = Stevens Anti-Vertigo
+displayName = Stevens Anti-Vertigo
 author = wxo
 version = 0.1.0
 side = Client
+sortAfter = SSMod_StevensMod
